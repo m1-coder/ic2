@@ -120,13 +120,11 @@ transductive_edges = {et: [] for et in data.edge_types}
 inductive_edges = {et: [] for et in data.edge_types}
 transductive_nodes = {nt: set() for nt in data.node_types}
 inductive_nodes = {nt: set() for nt in data.node_types}
-print(inductive_nodes)
-print(data.node_types)
-for et in data.edge_types: #遍历每一种边类型 et
+for et in data.edge_types:
     st, _, tt = et
     for u, v in data[et].edge_index.numpy().T:
-        if st in valid_nodes and u in valid_nodes[st]:#此时的valid_nodes里的键只有targets还是所以节点类型都有？
-            if tt not in targets :#为什么要确保不是目标类型，只要不是训练集就行了吗搞不懂，文中的做法不会遗漏一些并不能使全部符合不在训练集出现的都囊括在内呀;还是说为了只预测paper类型和不是paper类型的链接预测
+        if st in valid_nodes and u in valid_nodes[st]:
+            if tt not in targets :
                 inductive_edges[et].append((u, v))
                 inductive_nodes[st].add(u)
             continue
@@ -146,6 +144,21 @@ from torch_geometric.data import HeteroData
 trans_hdata = HeteroData()
 ind_hdata = HeteroData()
 
+for k in transductive_nodes:
+    transductive_nodes[k] = torch.tensor(list(transductive_nodes[k])).long()
+    inductive_nodes[k] = torch.tensor(list(inductive_nodes[k])).long()
+    trans_hdata[k].x = data[k].x
+    ind_hdata[k].x = data[k].x
+    trans_hdata[k].transductive_nodes = transductive_nodes[k]
+    ind_hdata[k].inductive_nodes = inductive_nodes[k]
+
+for k in transductive_edges:
+    transductive_edges[k] = torch.tensor(list(transductive_edges[k])).long().T
+    inductive_edges[k] = torch.tensor(list(inductive_edges[k])).long().T
+    trans_hdata[k].edge_index = transductive_edges[k]
+    if len(inductive_edges[k])!=0:
+        ind_hdata[k].edge_index = inductive_edges[k]
+
 def save_file(data, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'wb') as f:
@@ -157,7 +170,30 @@ if os.path.isfile('datasplits/' + 'ind' + name + '_train_data.pickle'):
     trans_valid_data = open_file('datasplits/' + 'ind' + name + '_train_valid_data.pickle')
     valid_data = open_file('datasplits/' + 'ind' + name + '_valid_data.pickle')
     test_data = open_file('datasplits/' + 'ind' + name + '_test_data.pickle')
+else:
+    rlp = RandomLinkSplit(edge_types=trans_hdata.edge_types,
+                          num_val=0.1, num_test=0,add_negative_train_samples=False
+    )
 
+    trans_train_data, trans_valid_data, _ = rlp(trans_hdata)
+    rlp2 = RandomLinkSplit(
+        edge_types=trans_hdata.edge_types,
+        num_val=0.0, num_test=0.0,add_negative_train_samples=False
+    )
+
+    train_data, _, _ = rlp2(trans_hdata)
+
+    rlp2 = RandomLinkSplit(
+        edge_types=ind_hdata.edge_types,
+        num_val=0.5, num_test=0.0)
+
+    valid_data, test_data, _ = rlp2(ind_hdata)
+
+    save_file(train_data, 'datasplits/' + 'ind' + name + '_train_data.pickle')
+    save_file(trans_train_data, 'datasplits/' + 'ind' + name + '_train_train_data.pickle')
+    save_file(trans_valid_data, 'datasplits/' + 'ind' + name + '_train_valid_data.pickle')
+    save_file(valid_data, 'datasplits/' + 'ind' + name + '_valid_data.pickle')
+    save_file(test_data, 'datasplits/' + 'ind' + name + '_test_data.pickle')
 
 
 transductive_dict = None
@@ -169,16 +205,124 @@ elif name == "ACM":
     transductive_dict = {'term': data['term'].num_nodes}
 
 sys.path.append(os.path.join(os.getcwd(), 'Fairwalk_master'))
-print(sys.path)
 import dataprocessing
 train_data_path = 'datasplits/ind{name}_train_data.pickle'
 train_data_fairwalk = dataprocessing.load_train_data_from_pickle(train_data_path)
 graph = dataprocessing.process_train_data_to_graph(train_data_fairwalk, original_to_homogeneous_map)
 node_embeddings = dataprocessing.get_edge_embeddings(graph)
+def process_train_data(homogeneous_graph, trans_datas,trans_val_datas,original_to_homogeneous_map,init_x):
+    edge_type_to_index = {etype: idx for idx, etype in enumerate(homo_edge_types)}
+    train_edge_index = []
+    train_edge_type = []
+    edge_label_list = []
+
+    for edge_type in trans_datas.edge_types:
+        src_type, rel, dst_type = edge_type
+        edge_index = trans_datas[edge_type].edge_index
+        print(edge_index)
+
+        for src, dst in edge_index.T:
+            src_h = original_to_homogeneous_map[(src_type, int(src))]
+            dst_h = original_to_homogeneous_map[(dst_type, int(dst))]
+            rel_idx = edge_type_to_index[edge_type]
+            train_edge_index.append([src_h, dst_h])
+            train_edge_type.append(rel_idx)
+    train_edge_index = torch.tensor(train_edge_index, dtype=torch.long).T
+    train_edge_type = torch.tensor(train_edge_type, dtype=torch.long)
+    mapped_edge_label_index = []
+    for edge_type in trans_datas.edge_types:
+        src_type, rel, dst_type = edge_type
+        edge_label_index = trans_datas[edge_type].edge_index
+        num_edges = edge_label_index.size(1)
+        edge_label = torch.ones(num_edges, dtype=torch.int64, device=edge_label_index.device)
+        for src, dst in edge_label_index.T:
+            src_h = original_to_homogeneous_map[(src_type, int(src))]
+            dst_h = original_to_homogeneous_map[(dst_type, int(dst))]
+            mapped_edge_label_index.append([src_h, dst_h])
+        edge_label_list.append(edge_label)
+    mapped_edge_label_index = torch.tensor(mapped_edge_label_index, dtype=torch.long).T
+    edge_label_list = torch.cat(edge_label_list, dim=0) if edge_label_list else None
+    mapped_edge_label_index_val = []
+    edge_label_list_val = []
+    for edge_type in trans_val_datas.edge_types:
+        src_type, rel, dst_type = edge_type
+        edge_label_index = trans_val_datas[edge_type].edge_label_index
+        edge_label = trans_val_datas[edge_type].edge_label
+        for src, dst in edge_label_index.T:
+            src_h = original_to_homogeneous_map[(src_type, int(src))]
+            dst_h = original_to_homogeneous_map[(dst_type, int(dst))]
+            mapped_edge_label_index_val.append([src_h, dst_h])
+        edge_label_list_val.append(edge_label)
+    mapped_edge_label_index_val = torch.tensor(mapped_edge_label_index_val, dtype=torch.long).T
+    edge_label_list_val = torch.cat(edge_label_list_val, dim=0) if edge_label_list_val else None
+    x = homogeneous_graph.x
+    total_rows_sum = 0
+    node_type_list = []
+    for i, node_feature_matrix in enumerate(init_x):
+        num_rows = node_feature_matrix.shape[0]
+        node_type_list.extend([i] * num_rows)
+        total_rows_sum += num_rows
+
+    node_type_clone = torch.tensor(node_type_list, dtype=torch.long)
+
+    num_nodes = homogeneous_graph.num_nodes
+
+    train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+    for node_type in homo_node_types:
+        if node_type in targets:
+            original_train_mask = splits[node_type].train_mask
+            original_val_mask = splits[node_type].val_mask
+            original_test_mask = splits[node_type].test_mask
+
+            for original_idx in torch.nonzero(original_train_mask, as_tuple=False).flatten():
+                homogeneous_idx = original_to_homogeneous_map[(node_type, int(original_idx))]
+                train_mask[homogeneous_idx] = True
+
+            for original_idx in torch.nonzero(original_val_mask, as_tuple=False).flatten():
+                homogeneous_idx = original_to_homogeneous_map[(node_type, int(original_idx))]
+                val_mask[homogeneous_idx] = True
+
+            for original_idx in torch.nonzero(original_test_mask, as_tuple=False).flatten():
+                homogeneous_idx = original_to_homogeneous_map[(node_type, int(original_idx))]
+                test_mask[homogeneous_idx] = True
+
+    processed_train_data = Data(
+        edge_index=train_edge_index,
+        edge_type=train_edge_type,
+        edge_label_index=mapped_edge_label_index,
+        edge_label=edge_label_list,
+        x=x,
+        node_type=node_type_clone.clone(),
+        train_mask=train_mask,
+        val_mask=val_mask,
+        test_mask=test_mask
+    )
+    processed_val_data= Data(
+        edge_index=train_edge_index,
+        edge_type=train_edge_type,
+        edge_label_index=mapped_edge_label_index_val,
+        edge_label=edge_label_list_val,
+        x=x,
+        node_type=node_type_clone.clone(),
+        train_mask=train_mask,
+        val_mask=val_mask,
+        test_mask=test_mask
+    )
+
+    return processed_train_data, processed_val_data
+
+teacher_train_data, teacher_valid_data = process_train_data(
+    homogeneous_graph,
+    trans_train_data,
+trans_valid_data,
+ original_to_homogeneous_map,
+    init_x
+)
 
 
-teacher_train_data=torch.load(f'./teacher_data/{name}_processed_train_data.pt')
-teacher_valid_data=torch.load(f'./teacher_data/{name}_processed_val_data.pt')
 
 if __name__ == '__main__':
     best_auc = -np.inf
